@@ -1,0 +1,6 @@
+lib/
+*.apk
+key.pem
+key.pk8
+cert.der
+dev/

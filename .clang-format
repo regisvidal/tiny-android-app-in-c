@@ -1,0 +1,34 @@
+# The C style of tpl2c: 4 spaces, every brace on the line of its statement
+# or function head, braces on every body, no one-line functions, if (x),
+# case labels indented in their switch, nothing aligned in columns
+# (declarations, macros, trailing comments, line-end backslashes), and a
+# blank line after declarations (not checked).
+# clang-format -i FILE.
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 120
+BreakBeforeBraces: Attach
+InsertBraces: true
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortEnumsOnASingleLine: true
+SortIncludes: Never
+IncludeBlocks: Preserve
+PointerAlignment: Right
+SpaceBeforeParens: ControlStatements
+AlignConsecutiveMacros: None
+AlignEscapedNewlines: DontAlign
+AlignTrailingComments: false
+ReflowComments: true
+IndentCaseLabels: true
+AlignAfterOpenBracket: Align
+BinPackArguments: true
+BinPackParameters: true
+AlwaysBreakAfterReturnType: None
+Cpp11BracedListStyle: false
+Standard: c++03
+AlignConsecutiveDeclarations: None
+SpacesBeforeTrailingComments: 1
