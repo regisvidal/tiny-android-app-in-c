@@ -7,9 +7,12 @@ explain each step.
 elf: keeps only the 2 section headers bionic needs.
 phdr: drops PT_PHDR and 3 .dynamic entries, puts the section headers over
 the program headers, and ends the file after .dynamic.
+hash: export size 0; on ELF64 also a one-bucket SysV hash table and
+.dynamic alignment 0.
 manifest: UTF-8 strings, empty attribute names, shared strings, line
 numbers and comments set to 0, shortest strings first, no closing tags at
-the end.
+the end, overlapping empty strings and normalized attribute values.
+cert: short or record certificates, preserving the source serial and dates.
 sign: the same v2 signature as apksigner, without the 4 KB alignment.
 
 ELF, binary XML and zip are all little-endian. Offsets in the comments are
@@ -24,6 +27,61 @@ def u32(n): return struct.pack('<I', n)
 def u64(n): return struct.pack('<Q', n)
 def lp(b):  return u32(len(b)) + b           # length-prefixed bytes
 def seq(*items): return lp(b''.join(lp(i) for i in items))  # list of lp items
+
+# Only the definite-length DER fields used by this app's X.509 v1
+# certificate are needed. Keep each original field as well as its contents.
+def der_fields(d):
+    fields, p = [], 0
+    while p < len(d):
+        start = p
+        if len(d) - p < 2:
+            raise ValueError('truncated DER header')
+        tag, n = d[p:p + 2]
+        p += 2
+        if n & 128:
+            k = n & 127
+            if not 1 <= k <= 4 or k > len(d) - p:
+                raise ValueError('invalid DER length')
+            n = int.from_bytes(d[p:p + k], 'big')
+            p += k
+        if n > len(d) - p:
+            raise ValueError('truncated DER value')
+        fields.append((tag, d[p:p + n], d[start:p + n]))
+        p += n
+    return fields
+
+def der(tag, d):
+    n = len(d)
+    k = (n.bit_length() + 7) // 8
+    length = bytes([n]) if n < 128 else bytes([128 + k]) + n.to_bytes(k, 'big')
+    return bytes([tag]) + length + d
+
+def public_key(key, compressed=False):
+    form = 'compressed' if compressed else 'uncompressed'
+    return subprocess.run(['openssl', 'ec', '-in', key, '-pubout',
+                           '-conv_form', form, '-outform', 'DER'],
+                          capture_output=True, check=True).stdout
+
+def small_cert(d, key, profile):
+    if profile not in ('short', 'record'):
+        raise ValueError('certificate profile must be short or record')
+    outer = der_fields(d)
+    if len(outer) != 1 or outer[0][0] != 0x30:
+        raise ValueError('expected one DER certificate')
+    parts = der_fields(outer[0][1])
+    if [x[0] for x in parts] != [0x30, 0x30, 0x03]:
+        raise ValueError('invalid certificate fields')
+    fields = der_fields(parts[0][1])
+    if [x[0] for x in fields] != [0x02, 0x30, 0x30, 0x30, 0x30, 0x30]:
+        raise ValueError('expected an X.509 v1 certificate')
+    # These are parser-dependent size profiles, not ordinary certificates.
+    # The APK signature still authenticates the complete certificate.
+    alg = bytes.fromhex('3003060100')
+    name = bytes.fromhex('3009310730050601000c00') if profile == 'short' else der(0x30, b'')
+    spki = public_key(key, profile == 'record')
+    # Copy the serial and validity verbatim, including seconds in both dates.
+    tbs = fields[0][2] + alg + name + fields[3][2] + name + spki
+    return der(0x30, der(0x30, tbs) + alg + der(0x03, b'\0'))
 
 # ELF: d[4] is the class, 2 for ELF64 (arm64, x86_64), 1 for ELF32 (armv7).
 # The layout is the same, only the field sizes differ. The tuple gives the
@@ -113,8 +171,10 @@ def shdr_overlap(d):
     shoff = struct.unpack_from(W, d, shoff_at)[0]    # old header 0: .dynstr
     assert struct.unpack_from('<I', d, shoff + S_TYPE)[0] == 3
     str_off, str_sz = struct.unpack_from('<' + W[1] * 2, d, shoff + S_OFF)
-    n = 0                                            # entries up to DT_NULL
+    n, tags = 0, {}                                  # entries up to DT_NULL
     while struct.unpack_from(W, d, dyn_off + 2 * w * n)[0] != 0:
+        t, v = struct.unpack_from('<' + W[1] * 2, d, dyn_off + 2 * w * n)
+        tags[t] = v
         n += 1
     dyn_sz = 2 * w * (n + 1)
     struct.pack_into(W, d, dyn + P_FILESZ, dyn_sz)
@@ -128,12 +188,65 @@ def shdr_overlap(d):
         struct.pack_into('<I', d, s0 + S_TYPE, 6)
         struct.pack_into('<' + W[1] * 3, d, s0 + S_OFF, dyn_off, dyn_sz, 1)
     s1 = s0 + sh
+    # The headers may run into .dynsym. Only undefined symbols may lie under
+    # the fields written here: an import's value and size are never read.
+    sym, ST_SHNDX = (24, 6) if w == 8 else (16, 14)
+    symtab, strtab = tags[6], tags[5]                # DT_SYMTAB, DT_STRTAB
+    for s in (s0, s1):
+        lo, hi = s + S_TYPE, s + S_SIZE + w
+        for i in range(max(0, (lo - symtab) // sym), (strtab - symtab) // sym):
+            if symtab + sym * i < hi and lo < symtab + sym * (i + 1):
+                assert struct.unpack_from('<H', d, symtab + sym * i + ST_SHNDX)[0] == 0, \
+                    'section header over defined symbol %d' % i
     struct.pack_into('<I', d, s1 + S_TYPE, 3)
     struct.pack_into('<' + W[1] * 2, d, s1 + S_OFF, str_off, str_sz)
     # e_shoff, then e_shnum 2, e_shstrndx 1
     struct.pack_into(W, d, shoff_at, s0)
     struct.pack_into('<HH', d, num_at, 2, 1)
     return d[:dyn_off + dyn_sz]
+
+# The SysV hash table (DT_HASH) is nbucket, nchain, the buckets, then one
+# chain entry per symbol, 32-bit words in both classes. The library
+# defines one symbol, the export: one bucket that points to it, and chains
+# of 0, end every lookup there, found or not. A GNU table (armv7) stays as it
+# is. The export's st_size and the alignment of PT_DYNAMIC are only read
+# by tools: both become 0, the alignment on ELF64 only. The addresses are
+# file offsets: the first PT_LOAD maps the file at 0.
+def hash_trim(d):
+    if d[4] == 2:
+        W, phoff_at, num_at, ph = '<Q', 0x20, 0x38, 56
+        P_OFF, P_ALIGN, sym, ST_SIZE, ST_SHNDX = 8, 48, 24, 16, 6
+    else:
+        W, phoff_at, num_at, ph = '<I', 0x1c, 0x2c, 32
+        P_OFF, P_ALIGN, sym, ST_SIZE, ST_SHNDX = 4, 28, 16, 8, 14
+    d = bytearray(d)
+    w = struct.calcsize(W)
+    phoff = struct.unpack_from(W, d, phoff_at)[0]
+    n = struct.unpack_from('<H', d, num_at)[0]
+    dyn = next(i for i in range(phoff, phoff + ph * n, ph)
+               if struct.unpack_from('<I', d, i)[0] == 2)   # PT_DYNAMIC
+    off = struct.unpack_from(W, d, dyn + P_OFF)[0]
+    tags = {}
+    while struct.unpack_from(W, d, off)[0] != 0:            # up to DT_NULL
+        tags[struct.unpack_from(W, d, off)[0]] = struct.unpack_from(W, d, off + w)[0]
+        off += 2 * w
+    symtab, strtab = tags[6], tags[5]                       # DT_SYMTAB, DT_STRTAB
+    name = lambda i: d[strtab + struct.unpack_from('<I', d, symtab + sym * i)[0]:
+                       d.index(0, strtab + struct.unpack_from('<I', d, symtab + sym * i)[0])]
+    e = next(i for i in range(1, 64) if name(i) == b'ANativeActivity_onCreate')
+    assert struct.unpack_from('<H', d, symtab + sym * e + ST_SHNDX)[0]
+    if 4 in tags:                                           # DT_HASH
+        h = tags[4]
+        nbucket, nchain = struct.unpack_from('<II', d, h)
+        assert not any(struct.unpack_from('<H', d, symtab + sym * i + ST_SHNDX)[0]
+                       for i in range(1, nchain) if i != e)     # the export only
+        size = 8 + 4 * (nbucket + nchain)
+        table = struct.pack('<III', 1, nchain, e) + bytes(4 * nchain)
+        d[h:h + size] = table + bytes(size - len(table))    # zeros compress
+    struct.pack_into(W, d, symtab + sym * e + ST_SIZE, 0)
+    if w == 8:                  # ELF32: p_align is sh_name, 0 deflates worse
+        struct.pack_into(W, d, dyn + P_ALIGN, 0)
+    return d
 
 # Binary XML: an 8 byte header, the string pool chunk, the resource map (the
 # resource ids of the first strings, the attribute names), then the nodes.
@@ -175,11 +288,19 @@ def small_manifest(x):
             seen[b] = len(pool)
             pool += bytes([len(strs[i]), len(b)]) + b + b'\0'
         offs.append(seen[b])
-    pool += bytes(-len(pool) % 4)            # chunks are 4-byte aligned
     start = phs + 4 * n
+    offsets = struct.pack('<%dI' % n, *offs)
+    strings_start = start
+    # The empty string's two lengths and terminator can share the high
+    # three zero bytes of the last offset. Every string offset stays put.
+    if pool[:3] == bytes(3) and offsets[-3:] == bytes(3):
+        strings_start -= 3
+        pool = pool[3:]
+    pool += bytes(-len(pool) % 4)            # chunks are 4-byte aligned
     chunk = (struct.pack('<HHIIIIII', 1, phs, start + len(pool), n, 0,
-                         flags | UTF8, start, 0)
-             + struct.pack('<%dI' % n, *offs) + pool)
+                         flags | UTF8, strings_start, 0)
+             + offsets + pool)
+    empty = next((i for i, old in enumerate(order) if strs[old] == ''), -1)
     # The nodes refer to strings by their index in the pool, and the order
     # changed: every index goes through remap().
     rest = bytearray(x[8 + psize:])
@@ -199,7 +320,8 @@ def small_manifest(x):
         t, _, sz = struct.unpack_from('<HHI', rest, p)
         assert t in (0x102, 0x103)           # start and end tags only
         struct.pack_into('<II', rest, p + 8, 0, 0)   # line, comment
-        remap(p + 16)                        # namespace
+        tag = strs[struct.unpack_from('<I', rest, p + 20)[0]]
+        struct.pack_into('<i', rest, p + 16, empty)  # element namespace
         remap(p + 20)                        # name
         if t == 0x102:                       # a start tag's attributes
             at, asz, count = struct.unpack_from('<HHH', rest, p + 24)
@@ -209,6 +331,15 @@ def small_manifest(x):
                 remap(a + 8)                 # raw value
                 if rest[a + 15] == 3:        # string value
                     remap(a + 16)
+                    if tag in ('application', 'activity'):
+                        struct.pack_into('<i', rest, a + 8, -1)  # typed string suffices
+                elif rest[a + 15] == 18:     # Boolean as integer 0 or 1
+                    rest[a + 15] = 16
+                    value = struct.unpack_from('<I', rest, a + 16)[0]
+                    struct.pack_into('<I', rest, a + 16, int(value != 0))
+                # These tags use resource IDs. Action/category keep their URI.
+                if tag in ('uses-sdk', 'application', 'activity'):
+                    struct.pack_into('<i', rest, a, -1)
         nodes.append((t, p))
         p += sz
     # The closing tags at the end can go: the parser stops at the end of the
@@ -218,7 +349,7 @@ def small_manifest(x):
     # The file header keeps its type and header size, with the new total.
     return x[:4] + u32(8 + len(chunk) + len(rest)) + chunk + bytes(rest)
 
-VERSION = '''apk.py 1.0
+VERSION = '''apk.py 1.2
 Copyright (c) 2026 Regis Vidal
 MIT License, see LICENSE.'''
 
@@ -229,15 +360,18 @@ manifest, and by signing it without padding.
 
   elf libmain.so            2 section headers instead of 10
   phdr libmain.so           smaller headers, file ends after .dynamic
+  hash libmain.so           one-bucket SysV hash table, sizes 0
   manifest file.apk         smaller binary manifest
+  cert PROFILE source.der key.pem out.der
+                            short: short names; record: empty names, compressed key
   sign unsigned.apk key.pem cert.der out.apk
                             v2 signature, no padding
   help                      this text
   version                   version, copyright and license
 
-elf, phdr and manifest rewrite the file in place.'''
+elf, phdr, hash and manifest rewrite the file in place.'''
 
-NARGS = {'elf': 1, 'phdr': 1, 'manifest': 1, 'sign': 4}
+NARGS = {'elf': 1, 'phdr': 1, 'hash': 1, 'manifest': 1, 'cert': 4, 'sign': 4}
 argv = sys.argv[1:]
 if argv[:1] in (['help'], ['-h'], ['--help']):
     print(USAGE)
@@ -258,6 +392,11 @@ if mode == 'phdr':
     d = open(path, 'rb').read()
     open(path, 'wb').write(shdr_overlap(phdr_drop(d)))
     sys.exit()
+if mode == 'hash':
+    (path,) = args
+    d = open(path, 'rb').read()
+    open(path, 'wb').write(hash_trim(d))
+    sys.exit()
 if mode == 'manifest':
     (path,) = args
     with zipfile.ZipFile(path) as z:
@@ -268,6 +407,17 @@ if mode == 'manifest':
             if i.filename == 'AndroidManifest.xml':
                 data = small_manifest(data)
             z.writestr(zipfile.ZipInfo(i.filename), data, i.compress_type, 9)
+    sys.exit()
+
+if mode == 'cert':
+    profile, source, key, out = args
+    try:
+        if profile not in ('short', 'record'):
+            raise ValueError('certificate profile must be short or record')
+        data = small_cert(open(source, 'rb').read(), key, profile)
+        open(out, 'wb').write(data)
+    except (OSError, ValueError, subprocess.CalledProcessError) as e:
+        sys.exit('cert: ' + str(e))
     sys.exit()
 
 src, key, cert, out = args
@@ -292,8 +442,9 @@ top = hashlib.sha256(b'\x5a' + u32(len(chunks)) + b''.join(
 # Algorithm id 0x0201: ECDSA with SHA-256, for the digest and the signature.
 ECDSA_SHA256 = 0x0201
 cert_der = open(cert, 'rb').read()
-pubkey = subprocess.run(['openssl', 'pkey', '-in', key, '-pubout', '-outform', 'DER'],
-                        capture_output=True, check=True).stdout
+# Android re-encodes the certificate's EC key before comparing it with this
+# field. Keep this copy uncompressed even for a compressed record certificate.
+pubkey = public_key(key)
 
 # The signed data: the digests, the certificates, and the additional
 # attributes. This is what the key signs.

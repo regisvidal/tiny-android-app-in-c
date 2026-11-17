@@ -4,3 +4,7 @@ key.pem
 key.pk8
 cert.der
 dev/
+record-key.pem
+cert-short.der
+cert-record.der
+cert-record-p224.der
